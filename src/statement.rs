@@ -6,15 +6,12 @@ use oci_bindings::{AttributeType, DescriptorType, EnvironmentMode, FetchType, Ha
 use oci_error::{get_error, OciError};
 use types::{SqlValue, ToSqlValue};
 use std::ptr;
+use std::slice;
+use std::str;
 use connection::Connection;
 use row::Row;
-use libc::{c_int, c_schar, c_short, c_uint, c_ushort, c_void};
+use libc::{c_int, c_uchar, c_schar, c_short, c_uint, c_ushort, c_void};
 
-#[derive(Debug)]
-enum ResultState {
-    Fetched,
-    NotFetched,
-}
 
 /// Represents a statement that is executed against a database.
 ///
@@ -39,22 +36,25 @@ pub struct Statement<'conn> {
     connection: &'conn Connection,
     statement: *mut OCIStmt,
     bindings: Vec<*mut OCIBind>,
+    columns: Option<Vec<Column>>,
     values: Vec<SqlValue>,
-    result_set: Vec<Row>,
-    result_state: ResultState,
 }
+
+
 impl<'conn> Statement<'conn> {
     /// Creates a new `Statement`.
     ///
-    pub(crate) fn new(connection: &'conn Connection, sql: &str) -> Result<Self, OciError> {
+    pub(crate) fn new(
+        connection: &'conn Connection,
+        sql: &str
+    ) -> Result<Self, OciError> {
         let statement = prepare_statement(connection, sql)?;
         Ok(Statement {
-            connection: connection,
-            statement: statement,
+            connection,
+            statement,
             bindings: Vec::new(),
+            columns: None,
             values: Vec::new(),
-            result_set: Vec::new(),
-            result_state: ResultState::NotFetched,
         })
     }
 
@@ -170,74 +170,6 @@ impl<'conn> Statement<'conn> {
     ///
     /// Any error in the underlying calls to the OCI library will be returned.
     ///
-    pub fn execute(&mut self) -> Result<(), OciError> {
-        let stmt_type = get_statement_type(self.statement, self.connection.error())?;
-        let iters = match stmt_type {
-            StatementType::Select => 0 as c_uint,
-            _ => 1 as c_uint,
-        };
-        let rowoff = 0 as c_uint;
-        let snap_in: *const OCISnapshot = ptr::null();
-        let snap_out: *mut OCISnapshot = ptr::null_mut();
-        let execute_result = unsafe {
-            OCIStmtExecute(
-                self.connection.service(),
-                self.statement,
-                self.connection.error(),
-                iters,
-                rowoff,
-                snap_in,
-                snap_out,
-                EnvironmentMode::Default.into(),
-            )
-        };
-        match execute_result.into() {
-            ReturnCode::Success => {
-                self.results_not_fetched();
-                Ok(())
-            }
-            _ => Err(get_error(
-                self.connection.error_as_void(),
-                HandleType::Error,
-                "Executing statement",
-            )),
-        }
-    }
-
-    /// Returns the results of a `SELECT` statement.
-    ///
-    /// After the execution of a `SELECT` statement a result set will be available from the
-    /// database. This will contain none or many `Row`s of data depending on the query. There are
-    /// two options for seeing the results, the first is to call this method to retrieve all the
-    /// rows in one go, the second is to iterate through them row by row.
-    ///
-    /// Should you go for the first option then the rows will be fetched from once this method is
-    /// called. They will not be fetched eagerly as part of the `.execute` call, although this is
-    /// not apparent to the caller. Once the results are retrieved from the database then they will
-    /// be held until either the `Statement` goes out of scope or `.execute` is called again. This
-    /// way, repeated calls to `.result_set` will be the same. If there are no data then an empty
-    /// `Vec<Row>` will be returned.
-    ///
-    /// The OCI library internally manages the number of rows that are pre-fetched from the
-    /// database. This can be tweaked at the OCI level, but is not currently available in this
-    /// crate. The OCI default is one row, so for each call to the database two rows are retrieved,
-    /// thus half the number of round trips needed.
-    ///
-    /// # Errors
-    ///
-    /// Any error in the underlying calls to the OCI library will be returned.
-    ///
-    pub fn result_set(&mut self) -> Result<&Vec<Row>, OciError> {
-        match self.result_state {
-            ResultState::Fetched => (),
-            ResultState::NotFetched => {
-                self.result_set = build_result_set(self.statement, self.connection.error())?;
-                self.results_fetched();
-            }
-        }
-        Ok(&self.result_set)
-    }
-
     /// Returns the results of a `SELECT` statement row by row via the `RowIter` iterator.
     ///
     /// The `RowIter` returned can then be used to run through the rows of data in the result set.
@@ -303,9 +235,81 @@ impl<'conn> Statement<'conn> {
     /// assert!(results.contains(&"FRANCE".to_string()));
     /// ```
     ///
-    pub fn lazy_result_set(&mut self) -> RowIter {
-        self.results_fetched();
-        RowIter { statement: self }
+    pub fn execute<'stmt>(&'stmt mut self) -> Result<Option<RowIter<'stmt, 'conn>>, OciError> {
+        let stmt_type = get_statement_type(self.statement, self.connection.error())?;
+        let iters = match stmt_type {
+            StatementType::Select => 0 as c_uint,
+            _ => 1 as c_uint,
+        };
+        let rowoff = 0 as c_uint;
+        let snap_in: *const OCISnapshot = ptr::null();
+        let snap_out: *mut OCISnapshot = ptr::null_mut();
+        let execute_result = unsafe {
+            OCIStmtExecute(
+                self.connection.service(),
+                self.statement,
+                self.connection.error(),
+                iters,
+                rowoff,
+                snap_in,
+                snap_out,
+                EnvironmentMode::Default.into(),
+            )
+        };
+        match execute_result.into() {
+            ReturnCode::Success => {
+                match stmt_type {
+                    StatementType::Select => Ok(Some(RowIter::new(self))),
+                    _ => Ok(None)
+                }
+            }
+            _ => Err(get_error(
+                self.connection.error_as_void(),
+                HandleType::Error,
+                "Executing statement",
+            )),
+        }
+    }
+    
+    /// get_columns should only be visible from RowIter object
+    /// when the query has return values. As getting columns for
+    /// query that doesn't return result doesn't make any sense.
+    fn get_columns(&mut self) -> Result<&Vec<Column>, OciError> {
+        match self.columns {
+            Some(ref columns) => Ok(columns),
+            None => {
+                let mut nmb_cols: c_uint = 0;
+                let nmb_cols_ptr: *mut c_uint = &mut nmb_cols;
+                let null_mut_ptr = ptr::null_mut();
+                let column_result = unsafe {
+                    OCIAttrGet(
+                        self.statement as *mut c_void,
+                        HandleType::Statement.into(),
+                        nmb_cols_ptr as *mut c_void,
+                        null_mut_ptr,
+                        AttributeType::ParameterCount.into(),
+                        self.connection.error(),
+                    )
+                };
+                
+                match column_result.into() {
+                    ReturnCode::Success => {
+                        let mut columns = Vec::new();
+                        for position in 1..(nmb_cols+1) {
+                            let handle = allocate_parameter_handle(self.statement, self.connection.error(), position)?;
+                            columns.push(Column::new(position, handle, self.connection.error())?);
+                        }
+                        
+                        Ok(self.columns.get_or_insert(columns))
+                    },
+                    _ => Err(get_error(
+                        self.connection.error() as *mut c_void,
+                        HandleType::Error,
+                        "Getting number of columns",
+                    )),
+                }
+            }
+        }
     }
 
     /// Commits the changes to the database.
@@ -337,17 +341,36 @@ impl<'conn> Statement<'conn> {
             )),
         }
     }
-
-    /// Transition to fetched state.
-    ///
-    fn results_fetched(&mut self) -> () {
-        self.result_state = ResultState::Fetched
-    }
-
-    /// Transition to not-fetched state.
-    ///
-    fn results_not_fetched(&mut self) -> () {
-        self.result_state = ResultState::NotFetched
+    
+    fn build_result_row(&mut self) -> Result<Option<Row>, OciError> {
+        self.get_columns()?;
+        
+        for column in self.columns.as_mut().unwrap() {
+            if column.data_holder.is_none() {
+                let holder = define_output_parameter(
+                    self.statement,
+                    self.connection.error(),
+                    column.position,
+                    column.data_size,
+                    &column.data_type,
+                )?;
+                column.data_holder = Some(holder);
+            }
+        }
+        
+        match fetch_next_row(self.statement, self.connection.error()) {
+            Ok(result) => match result {
+                FetchResult::Data => (),
+                FetchResult::NoData => return Ok(None),
+            },
+            Err(err) => return Err(err),
+        }
+        
+        let mut sql_values = Vec::new();
+        for ref column in self.columns.as_ref().unwrap() {
+            sql_values.push(column.create_sql_value()?);
+        }
+        Ok(Some(Row::new(sql_values)))
     }
 }
 
@@ -359,6 +382,19 @@ impl<'conn> Drop for Statement<'conn> {
     /// Panics if the resources can't be freed. This would be
     /// a failure of the underlying OCI function.
     fn drop(&mut self) {
+        
+        if let Some(ref columns) = self.columns {
+            for column in columns {
+                let descriptor_free_result = unsafe {
+                    OCIDescriptorFree(column.param as *mut c_void, DescriptorType::Parameter.into())
+                };
+                match descriptor_free_result.into() {
+                    ReturnCode::Success => (),
+                    _ => panic!("Could not free the parameter descriptor in Cell"),
+                }
+            }
+        }
+        
         if let Err(err) = release_statement(self.statement, self.connection.error()) {
             panic!(format!(
                 "Could not release the statement Statement: {}",
@@ -374,14 +410,28 @@ impl<'conn> Drop for Statement<'conn> {
 ///
 /// [1]: struct.Statement.html#method.lazy_result_set
 #[derive(Debug)]
-pub struct RowIter<'stmt> {
-    statement: &'stmt Statement<'stmt>,
+pub struct RowIter<'stmt, 'conn:'stmt> {
+    statement: &'stmt mut Statement<'conn>,
 }
-impl<'stmt> Iterator for RowIter<'stmt> {
+
+impl<'stmt, 'conn:'stmt> RowIter<'stmt, 'conn> {
+    /// create a new result set iterator
+    pub fn new(statement: &'stmt mut Statement<'conn>) -> Self {
+        RowIter {statement}
+    }
+
+    /// Return reference to column metadata information
+    ///
+    pub fn columns(&mut self) -> Result<&Vec<Column>, OciError> {
+        self.statement.get_columns()
+    }
+}
+
+impl<'stmt, 'conn:'stmt> Iterator for RowIter<'stmt, 'conn> {
     type Item = Result<Row, OciError>;
 
     fn next(&mut self) -> Option<Result<Row, OciError>> {
-        match build_result_row(self.statement.statement, self.statement.connection.error()) {
+        match self.statement.build_result_row() {
             Ok(option) => match option {
                 Some(row) => Some(Ok(row)),
                 None => None,
@@ -392,7 +442,10 @@ impl<'stmt> Iterator for RowIter<'stmt> {
 }
 
 /// Release statement
-fn release_statement(statement: *mut OCIStmt, error: *mut OCIError) -> Result<(), OciError> {
+fn release_statement(
+    statement: *mut OCIStmt,
+    error: *mut OCIError,
+) -> Result<(), OciError> {
     let key_ptr = ptr::null();
     let key_len = 0 as c_uint;
     let release_result = unsafe {
@@ -451,7 +504,7 @@ fn prepare_statement(connection: &Connection, sql: &str) -> Result<*mut OCIStmt,
 }
 
 /// Find out what sort of statement was prepared
-fn get_statement_type(
+pub fn get_statement_type(
     statement: *mut OCIStmt,
     error: *mut OCIError,
 ) -> Result<StatementType, OciError> {
@@ -480,7 +533,6 @@ fn get_statement_type(
 }
 
 #[derive(Debug)]
-
 struct ColumnPtrHolder {
     define: *mut OCIDefine,
     buffer: Vec<u8>,
@@ -489,43 +541,68 @@ struct ColumnPtrHolder {
     null_ind_ptr: *mut c_short,
 }
 
+/// Represents metadata information of a returned column from a SQL query.
+///
 #[derive(Debug)]
-struct Column {
-    handle: *mut OCIParam,
-    sql_type: OciDataType,
-    column_ptr_holder: ColumnPtrHolder,
+pub struct Column {
+    position: c_uint,
+    param: *mut OCIParam,
+    name: String,
+    data_type: OciDataType,
+    data_size: c_ushort,
+    data_holder: Option<ColumnPtrHolder>
 }
+
 impl Column {
-    fn new(
-        statement: *mut OCIStmt,
-        error: *mut OCIError,
+    /// Create a new instance of Column
+    pub(crate) fn new(
         position: c_uint,
-    ) -> Result<Column, OciError> {
-        let parameter = allocate_parameter_handle(statement, error, position)?;
-        let data_type = determine_external_data_type(parameter, error)?;
-        let data_size = column_data_size(parameter, error)?;
-        let column_ptr_holder =
-            define_output_parameter(statement, error, position, data_size, &data_type)?;
-        Ok(Column {
-            handle: parameter,
-            sql_type: data_type,
-            column_ptr_holder,
-        })
+        param: *mut OCIParam,
+        error: *mut OCIError
+    )-> Result<Self, OciError> {
+        let data_type = determine_external_data_type(param, error)?;
+        let data_size = column_data_size(param, error)?;
+        let name = column_name(param, error)?;
+        Ok(Column { position, param, name, data_type, data_size, data_holder: None })
     }
 
+    /// Returns the position of column. Position starts from 1.
+    ///
+    pub fn position(&self) -> c_uint {
+        self.position
+    }
+
+    /// Returns the name of column.
+    ///
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the data type of column
+    ///
+    pub fn data_type(&self) -> &OciDataType {
+        &self.data_type
+    }
+
+    /// Returns the data size of column
+    ///
+    pub fn data_size(&self) -> c_ushort {
+        self.data_size
+    }
+    
     fn create_sql_value(&self) -> Result<SqlValue, OciError> {
         if self.is_null() {
             Ok(SqlValue::Null)
         } else {
             Ok(SqlValue::create_from_raw(
-                &self.column_ptr_holder.buffer,
-                &self.sql_type,
+                &self.data_holder.as_ref().unwrap().buffer,
+                &self.data_type,
             )?)
         }
     }
 
     fn is_null(&self) -> bool {
-        *self.column_ptr_holder.null_ind == -1
+        *self.data_holder.as_ref().unwrap().null_ind == -1
     }
 }
 
@@ -563,6 +640,7 @@ fn define_output_parameter(
             EnvironmentMode::Default.into(),
         )
     };
+    
     match define_result.into() {
         ReturnCode::Success => Ok(ColumnPtrHolder {
             define,
@@ -579,7 +657,10 @@ fn define_output_parameter(
     }
 }
 
-fn column_data_size(parameter: *mut OCIParam, error: *mut OCIError) -> Result<c_ushort, OciError> {
+fn column_data_size(
+    parameter: *mut OCIParam,
+    error: *mut OCIError
+) -> Result<c_ushort, OciError> {
     let mut size: c_ushort = 0;
     let size_ptr: *mut c_ushort = &mut size;
     let null_mut_ptr = ptr::null_mut();
@@ -597,6 +678,38 @@ fn column_data_size(parameter: *mut OCIParam, error: *mut OCIError) -> Result<c_
         ReturnCode::Success => Ok(size),
         _ => Err(get_error(
             error as *mut c_void,
+            HandleType::Error,
+            "Getting column data size",
+        )),
+    }
+}
+
+fn column_name(
+    parameter: *mut OCIParam,
+    error: *mut OCIError
+) -> Result<String, OciError> {
+    let mut name_ptr: *mut c_uchar = ptr::null_mut();
+    let name_ptr_ptr: *mut *mut c_uchar = &mut name_ptr;
+    let mut name_len: c_uint = 0;
+    let name_len_ptr: *mut c_uint = &mut name_len;
+    let ret = unsafe {
+        OCIAttrGet(
+            parameter as *mut c_void,
+            DescriptorType::Parameter.into(),
+            name_ptr_ptr as *mut c_void,
+            name_len_ptr,
+            AttributeType::Name.into(),
+            error,
+        )
+    };
+    match ret.into() {
+        ReturnCode::Success => {
+            let byte_slice = unsafe {slice::from_raw_parts(name_ptr, name_len as usize).clone()};
+            let str_slice = str::from_utf8(byte_slice).unwrap();
+            let str_string = str_slice.to_owned();  // if necessary
+            Ok(str_string)
+        },
+        _ => Err(get_error(error as *mut c_void,
             HandleType::Error,
             "Getting column data size",
         )),
@@ -738,116 +851,28 @@ fn allocate_parameter_handle(
     }
 }
 
-impl Drop for Column {
-    fn drop(&mut self) {
-        // let define_free_result =
-        //    unsafe { OCIHandleFree(self.define as *mut c_void, HandleType::Define.into()) };
-        // match define_free_result.into() {
-        //    ReturnCode::Success => (),
-        //    _ => panic!("Could not free the define handle in Column"),
-        // }
-        let descriptor_free_result = unsafe {
-            OCIDescriptorFree(self.handle as *mut c_void, DescriptorType::Parameter.into())
-        };
-        match descriptor_free_result.into() {
-            ReturnCode::Success => (),
-            _ => panic!("Could not free the parameter descriptor in Column"),
-        }
-    }
-}
-
-fn number_of_columns(statement: *mut OCIStmt, error: *mut OCIError) -> Result<c_uint, OciError> {
-    let mut nmb_cols: c_uint = 0;
-    let nmb_cols_ptr: *mut c_uint = &mut nmb_cols;
-    let null_mut_ptr = ptr::null_mut();
-    let column_result = unsafe {
-        OCIAttrGet(
-            statement as *mut c_void,
-            HandleType::Statement.into(),
-            nmb_cols_ptr as *mut c_void,
-            null_mut_ptr,
-            AttributeType::ParameterCount.into(),
-            error,
-        )
-    };
-
-    match column_result.into() {
-        ReturnCode::Success => Ok(nmb_cols),
-        _ => Err(get_error(
-            error as *mut c_void,
-            HandleType::Error,
-            "Getting number of columns",
-        )),
-    }
-}
-
-fn build_result_row(
-    statement: *mut OCIStmt,
-    error: *mut OCIError,
-) -> Result<Option<Row>, OciError> {
-    let column_count = number_of_columns(statement, error)?;
-    let mut columns = Vec::new();
-
-    for position in 1..(column_count + 1) {
-        let column = Column::new(statement, error, position)?;
-        columns.push(column)
-    }
-
-    match fetch_next_row(statement, error) {
-        Ok(result) => match result {
-            FetchResult::Data => (),
-            FetchResult::NoData => return Ok(None),
-        },
-        Err(err) => return Err(err),
-    }
-
-    let mut sql_values = Vec::new();
-    for col in columns {
-        sql_values.push(col.create_sql_value()?);
-    }
-    Ok(Some(Row::new(sql_values)))
-}
-
-fn build_result_set(statement: *mut OCIStmt, error: *mut OCIError) -> Result<Vec<Row>, OciError> {
-    let mut rows = Vec::new();
-    loop {
-        let row = match build_result_row(statement, error) {
-            Ok(result) => match result {
-                Some(row) => row,
-                None => break,
-            },
-            Err(err) => return Err(err),
-        };
-        rows.push(row)
-    }
-    Ok(rows)
-}
-
 enum FetchResult {
     Data,
     NoData,
 }
 
-fn fetch_next_row(statement: *mut OCIStmt, error: *mut OCIError) -> Result<FetchResult, OciError> {
+fn fetch_next_row(
+    statement: *mut OCIStmt,
+     error: *mut OCIError,
+) -> Result<FetchResult, OciError> {
     let nrows = 1 as c_uint;
     let offset = 0 as c_int;
     let fetch_result = unsafe {
-        OCIStmtFetch2(
-            statement,
-            error,
-            nrows,
-            FetchType::Next.into(),
-            offset,
-            EnvironmentMode::Default.into(),
-        )
+        OCIStmtFetch2(statement,
+                      error,
+                      nrows,
+                      FetchType::Next.into(),
+                      offset,
+                      EnvironmentMode::Default.into())
     };
     match fetch_result.into() {
         ReturnCode::Success => Ok(FetchResult::Data),
         ReturnCode::NoData => Ok(FetchResult::NoData),
-        _ => Err(get_error(
-            error as *mut c_void,
-            HandleType::Error,
-            "Fetching",
-        )),
+        _ => Err(get_error(error as *mut c_void, HandleType::Error, "Fetching")),
     }
 }

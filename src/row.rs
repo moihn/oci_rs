@@ -5,23 +5,25 @@ use types::SqlValue;
 ///
 #[derive(Debug)]
 pub struct Row {
-    columns: Vec<SqlValue>,
+    cells: Vec<SqlValue>,
 }
 impl Row {
-    pub(crate) fn new(columns: Vec<SqlValue>) -> Row {
-        Row { columns: columns }
+    pub(crate) fn new(
+        cells: Vec<SqlValue>
+    )-> Self {
+        Row { cells }
     }
 
     /// Returns the columns in the row.
     ///
-    pub fn columns(&self) -> &Vec<SqlValue> {
-        &self.columns
+    pub fn cells(&self) -> &Vec<SqlValue> {
+        &self.cells
     }
 }
 impl Index<usize> for Row {
     type Output = SqlValue;
 
     fn index(&self, index: usize) -> &SqlValue {
-        &self.columns[index]
+        &self.cells[index]
     }
 }

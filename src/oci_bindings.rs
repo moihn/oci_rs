@@ -132,22 +132,26 @@ impl<'hnd> From<HandleType> for &'hnd str {
     }
 }
 
-const OCI_ATTR_DATA_SIZE: c_uint = 1;
-const OCI_ATTR_DATA_TYPE: c_uint = 2;
-const OCI_ATTR_PRECISION: c_uint = 5;
-const OCI_ATTR_SCALE: c_uint = 6;
-const OCI_ATTR_SERVER: c_uint = 6;
-const OCI_ATTR_SESSION: c_uint = 7;
+const OCI_ATTR_DATA_SIZE:   c_uint = 1;
+const OCI_ATTR_DATA_TYPE:   c_uint = 2;
+const OCI_ATTR_DISP_SIZE:   c_uint = 3;
+const OCI_ATTR_NAME:        c_uint = 4;
+const OCI_ATTR_PRECISION:   c_uint = 5;
+const OCI_ATTR_SCALE:       c_uint = 6;
+const OCI_ATTR_SERVER:      c_uint = 6;
+const OCI_ATTR_SESSION:     c_uint = 7;
 const OCI_ATTR_PARAM_COUNT: c_uint = 18;
-const OCI_ATTR_USERNAME: c_uint = 22;
-const OCI_ATTR_PASSWORD: c_uint = 23;
-const OCI_ATTR_STMT: c_uint = 24;
-const OCI_ATTR_PARAM: c_uint = 124;
+const OCI_ATTR_USERNAME:    c_uint = 22;
+const OCI_ATTR_PASSWORD:    c_uint = 23;
+const OCI_ATTR_STMT:        c_uint = 24;
+const OCI_ATTR_PARAM:       c_uint = 124;
 
 #[derive(Debug)]
 pub enum AttributeType {
     DataSize,
     DataType,
+    DispSize,
+    Name,
     Precision,
     Scale,
     Server,
@@ -164,6 +168,8 @@ impl From<AttributeType> for c_uint {
         match attribute_type {
             AttributeType::DataSize => OCI_ATTR_DATA_SIZE,
             AttributeType::DataType => OCI_ATTR_DATA_TYPE,
+            AttributeType::DispSize => OCI_ATTR_DISP_SIZE,
+            AttributeType::Name     => OCI_ATTR_NAME,
             AttributeType::Precision => OCI_ATTR_PRECISION,
             AttributeType::Scale => OCI_ATTR_SCALE,
             AttributeType::Server => OCI_ATTR_SERVER,

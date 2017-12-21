@@ -8,21 +8,20 @@ Documentation is available [here][12].
 
 ## Setup
 
-This crate is developed against version 12.2 of the OCI library. It is expected to work with
-12.x.x but is not tested. The OCI client library needs to be installed on your machine and can be
+This crate is developed against version 11.1 of the OCI library. It is expected to work with
+any newer version. The OCI client library needs to be installed on your machine and can be
 downloaded [here][7].
 
 If you are on Linux then you are likely to need to tell the linker where
-to find the files. Adding this to my `.bashrc` file worked for me, however the details may vary
-according to your distro, mine is [OpenSuse][8].
+to find the files. Adding this to my `.bashrc` file worked for me, however the details may vary according to your distro, for [openSuse and Redhat/Oracle Enterprise Linux 7][8].
 
 ```text
-export LIBRARY_PATH=$LIBRARY_PATH:/usr/lib/oracle/12.2/client64/lib/
+export LIBRARY_PATH=$LIBRARY_PATH:/usr/lib/oracle/[oci_version]/client64/lib/
 ```
 
 This crate has not been tested against Windows and so the setup will be different.
 
-Testing has been done against a local installation of [Oracle 11g Express Edition][9].
+Testing has been done against a local installation of [Oracle 11g and 12g][9].
 In order to run the crate tests then a local database needs to be
 available on `localhost:1521/xe` with a user `oci_rs` and password `test`.
 
@@ -81,28 +80,81 @@ for value in values.iter() {
 
 insert.commit().unwrap();
 
-// Create a query
-let sql_select = "SELECT * FROM Toys
-                  WHERE Name='Barbie'";
+{
+    // create a select query
+    let sql = "SELECT * FROM AM_USER_ROLE";
+    let mut select = match conn.create_prepared_statement(sql)
+    {
+        Ok(select) => select,
+        Err(err) => panic!("failed to create select statement {}", err),
+    };
+    // get optional result, which is result set for select query
+    let optional_rs = select.execute().unwrap();
+    if let Some(mut rs) = optional_rs {
+        {
+            let columns = rs.columns().unwrap();
+            for column in columns {
+                print!("{},", column.name());
+            }
+            println!();
+        }
+        while let Some(row) = rs.next() {
+            for cell in row.unwrap().cells()
+            {
+                match String::from_sql_value(&cell)
+                {
+                    Some(vstr) => print!("{},", vstr),
+                    None => print!("unsupported_value_type"),
+                }
+            }
+            println!();
+        }
+    }
+}
 
-let mut select = conn.create_prepared_statement(sql_select).unwrap();
-
-// Execute
-select.execute().unwrap();
-
-// Get the result set
-let result_set = select.result_set().unwrap();
-assert_eq!(result_set.len(), 1);
-let first_row = &result_set[0];
-
-// Types are automatically converted
-let id: i64 = first_row[0].value().unwrap();
-let name: String = first_row[1].value().unwrap();
-let price: f64 = first_row[2].value().unwrap();
-
-assert_eq!(id, 1);
-assert_eq!(name, "Barbie");
-assert_eq!(price, 23.45);
+{
+    // create a same query but get the result set in another way
+    let sql = "SELECT * FROM AM_USER_ROLE";
+    let mut select = match conn.create_prepared_statement(sql)
+    {
+        Ok(select) => select,
+        Err(err) => panic!("failed to create select statement {}", err),
+    };
+    // get the result set
+    let optional_rs = select.execute().unwrap();
+    if let Some(mut rs) = optional_rs {
+        {
+            let columns = rs.columns().unwrap();
+            for column in columns {
+                print!("{},", column.name());
+            }
+            println!();
+        }
+        // get all the result rows at once
+        let rows_result: Result<Vec<_>, OciError> = rs.collect();
+        match rows_result {
+            Ok(rows) => for row in rows {
+                for cell in row.cells()
+                {
+                    match String::from_sql_value(&cell)
+                    {
+                        Some(vstr) => print!("{},", vstr),
+                        None => print!("unsupported_value_type"),
+                    }
+                }
+                /*
+                 if you know the type of column value,
+                 you also can use something like:
+                 let id: i64 = first_row[0].value().unwrap();
+                 let name: String = first_row[1].value().unwrap();
+                 let price: f64 = first_row[2].value().unwrap();
+                 */
+                println!();
+            },
+            Err(err) => panic!("failed to get rows: {}", err),
+        }
+    }
+}
 
 ```
 
